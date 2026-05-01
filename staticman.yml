@@ -40,7 +40,7 @@ comments:
   moderation: true
 
   # When allowedOrigins is defined, only requests sent from one of the listed domains will be accepted.
-  allowedOrigins: ["localhost", "ita93.github.io"]
+  allowedOrigins: ["localhost", "phi-nguyendp.github.io"]
 
   # (*) REQUIRED
   #

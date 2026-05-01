@@ -109,7 +109,7 @@ Theo như định nghĩa ở trên thì KVM là một đứa nhập nhằng khô
 ```
 
 ## II. Tự viết VMM bằng Rust.
-[`GITHUB`]("https://github.com/ita93/rust-kvm-tool/tree/main")
+[`GITHUB`]("https://github.com/phi-nguyendp/rust-kvm-tool/tree/main")
 
 Thực tế thì việc viết một VMM sử dụng Rust khá là đơn giản bằng cách sử dụng các crate có sẵn của rust-vmm, tuy nhiên do mục tiêu học tập và tìm hiểu, mình sẽ không sử dụng các wrapper/helper của rust-vmm, thay vào đó sẽ sử dụng raw libc function để tương tác với kvm. Tuy vậy, việc viết/gen lại các hằng số cơ bản khác mất thời gian, nên đối với các hằng số, mình sẽ sử dụng lại định nghĩa sẵn của rust-vmm.
 Về cách sử dụng của KVM API, trên LWN đã có một bài hướng dẫn khá đầy đủ [`Using KVM API`]("https://lwn.net/Articles/658511/") . Cơ bản thì nó có mấy bước sau:
@@ -213,7 +213,7 @@ Guest Physical Address (GPA)
 Host Physical Address (HPA)
 ```
 
-Chúng ta cần cung cấp địa chỉ vùng nhớ dự định sử dụng cho VM với KVM handle, thông qua ioctl, nhưng trước hết mình sẽ define một struct để việc quản lý và giải phóng vùng nhớ này được dễ dàng hơn [`memory.rs`]("https://github.com/ita93/rust-kvm-tool/blob/main/src/memory.rs")
+Chúng ta cần cung cấp địa chỉ vùng nhớ dự định sử dụng cho VM với KVM handle, thông qua ioctl, nhưng trước hết mình sẽ define một struct để việc quản lý và giải phóng vùng nhớ này được dễ dàng hơn [`memory.rs`]("https://github.com/phi-nguyendp/rust-kvm-tool/blob/main/src/memory.rs")
 {% highlight rust %} 
 pub(crate) struct MemoryWrapper {
     // NonNull verifies the pointer isn't null and is useful for optimization
@@ -600,7 +600,7 @@ impl VM {
 vm.load_code(&code)?;
 {% endhighlight %}
 
-Đoạn code 64bit sẽ sử dụng là : [`hello.S`]("https://github.com/ita93/rust-kvm-tool/blob/main/64bits-baremetal/hello.S")
+Đoạn code 64bit sẽ sử dụng là : [`hello.S`]("https://github.com/phi-nguyendp/rust-kvm-tool/blob/main/64bits-baremetal/hello.S")
 Lưu ý rằng chúng ta sẽ load compiled binary file vào bộ nhớ chứ không phải text file này. 
 compile: `nasm -f elf64 -o hello.o hello.asm`
 Sau khi load code vào memory, KVM vẫn chưa biết rằng nó phải bắt đầu chạy code từ đâu vì chúng ta chưa setup RIP cho nó.
@@ -709,7 +709,7 @@ Tuy nhiên nếu chỉ có in ra mỗi hello world thì nó cũng không có gì
 Dể demo rõ ràng hơn về VMM, chúng ta sẽ nâng cấp nó để nó có thể boot được một vmlinux cơ bản.
 Đầu tiên cần chuẩn bị một file `vmlinux`, có thể tự compile, hoặc download nó về từ 
 ```
-https://github.com/ita93/rust-kvm-tool/blob/main/64bits-baremetal/vmlinux.bin
+https://github.com/phi-nguyendp/rust-kvm-tool/blob/main/64bits-baremetal/vmlinux.bin
 ```
 Đây là một file ELF
 ```
