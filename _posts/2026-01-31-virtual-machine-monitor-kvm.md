@@ -5,7 +5,7 @@ category: Virtualization
 
 comments: true
 ---
-# Virtual Machine Monitor với KVM và Rust
+# Virtual Machine Monitor với KVM và Rust (update: 2026-09-26)
 Thử viết một VMM dựa trên KVM API bằng Rust trong đôi ngày cuối tuần.
 {:toc}
 
@@ -1259,9 +1259,158 @@ Ta thêm 1 match arm vào handle_io để ghi 0x20 vào 0x61
 Thử chạy lại VMM:
 [![asciicast](https://asciinema.org/a/7NbtVpBDVH8Jyn0k.svg)](https://asciinema.org/a/7NbtVpBDVH8Jyn0k)
 
-Ok, lần này đúng như mong đợi, nó đã panic ở bước load rootfs vì ta không cung cấp cho nó file rootfs nào cả. Nếu có thời gian sẽ cập nhật, không thì thôi.
+Ok, lần này đúng như mong đợi, nó đã panic ở bước load rootfs vì ta không cung cấp cho nó file rootfs nào cả.
 
 Như vậy, ta đã có một VMM cơ bản có thể boot được linux kernel viết bằng Rust.
+
+## IV. Boot rootfs (busybox) (Đoạn này phần lớn được viết bởi thầy Claude code)
+Mục tiêu lần này là load được một rootfs (busybox) để kernel không panic ngay ở bước tìm init nữa, mà thực sự chạy được một cái shell.
+
+### Chuẩn bị rootfs
+Do VMM của mình chưa emulate bất kỳ block device nào (chưa có virtio-blk, chưa có AHCI/IDE gì cả), nên thay vì mount một rootfs thật từ disk, cách đơn giản nhất là dùng initramfs (cpio archive được giải nén thẳng vào RAM bởi kernel) - kernel có sẵn cơ chế: nếu tìm thấy file `/init` bên trong initramfs, nó sẽ exec file này làm PID 1 mà không cần `root=`/`rdinit=` gì thêm.
+
+Mình có sẵn một bản busybox tự build từ trước, sau khi `make CONFIG_PREFIX=_install install` thì có một thư mục `_install` chứa toàn bộ symlink của các applet trỏ về `bin/busybox`. Việc còn lại là đóng gói thư mục này thành một cpio archive đúng chuẩn (format `newc`).
+
+Mình đã nhờ thầy Claude code viết một script Python độc lập (`tools/mkinitramfs.py`) để làm việc này - lý do dùng Python thay vì gọi `cpio`/`fakeroot` có sẵn là vì mình cần thêm vài device node đặc biệt (`/dev/console`, `/dev/null`,...) mà không có quyền `mknod` thật trên máy host, nên phải tự encode header `newc` bằng tay:
+{% highlight python %}
+def header(name: bytes, mode: int, filesize: int, ino: int, rdevmajor=0, rdevminor=0) -> bytes:
+    namesize = len(name) + 1  # cpio filenames are NUL-terminated
+    fields = [ino, mode, 0, 0, 1, int(time.time()), filesize,
+              0, 0, rdevmajor, rdevminor, namesize, 0]
+    return b"070701" + b"".join(b"%08X" % f for f in fields)
+{% endhighlight %}
+Script này sẽ tự thêm vào vài thư mục cần thiết (`/proc`, `/sys`, `/dev`,...), vài device node (`/dev/console` major 5 minor 1 là quan trọng nhất - kernel cần mở được file này để làm stdin/stdout/stderr cho PID 1), và một file `/init` tự sinh:
+{% highlight bash %}
+#!/bin/sh
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev 2>/dev/null
+
+echo
+echo "=== rust-kvm-tool: busybox initramfs loaded ==="
+/bin/busybox uname -a
+echo "Dropping to a busybox shell (exec /bin/sh)."
+echo
+
+exec /bin/sh
+{% endhighlight %}
+
+### Load initrd vào memory
+Để không đụng vào `load_code()` (hàm cũ, đã viết boot_params với `ramdisk_image = 0`), mình thêm một hàm hoàn toàn mới `load_initrd()`, chạy SAU `load_code()`: nó copy dữ liệu cpio vào guest memory rồi patch lại đúng 2 field `ramdisk_image`/`ramdisk_size` của struct `boot_params` đã được `load_code()` ghi vào memory trước đó.
+{% highlight rust %}
+pub fn load_initrd(&self, initrd: &[u8]) -> Result<__u64> {
+    // enter_long_mode() chỉ identity-map 512 * 2MB = 1GB đầu của guest memory
+    // (xem lại phần Page Directory ở trên), nên initrd phải nằm trong vùng này
+    const IDENTITY_MAP_LIMIT: u64 = 512 * 0x200000;
+
+    let addr = (IDENTITY_MAP_LIMIT - initrd.len() as u64) & !0xfff;
+
+    unsafe {
+        let dest = self.memory_regions.userspace_addr.as_mut_ptr();
+        std::ptr::copy_nonoverlapping(initrd.as_ptr(), dest.add(addr as usize), initrd.len());
+
+        let bp_ptr = dest.add(ADDR_BOOT_PARAMS as usize) as *mut boot_params;
+        (*bp_ptr).hdr.ramdisk_image = addr as u32;
+        (*bp_ptr).hdr.ramdisk_size = initrd.len() as u32;
+    }
+
+    Ok(addr)
+}
+{% endhighlight %}
+`main.rs` chỉ cần thêm một khối `if let Some(initrd_path) = ...` để load file thứ 2 (optional) từ argv, gọi hàm này sau `load_code()` - không có dòng code cũ nào bị sửa cả.
+
+### Lần chạy đầu tiên: kernel unpack được initramfs, nhưng im lặng khó hiểu
+{% highlight bash %}
+[    0.000000] RAMDISK: [mem 0x3fd78000-0x3fffffff]
+...
+[    0.119960] Unpacking initramfs...
+[    0.130565] Freeing initrd memory: 2592K
+...
+[    0.829519] Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000000
+[    0.831994] CPU: 0 PID: 1 Comm: sh Not tainted 4.14.174 #2
+{% endhighlight %}
+Initramfs được unpack thành công (`Freeing initrd memory` chứng tỏ cpio archive đúng format), và `Comm: sh` trong panic trace nghĩa là `/init` (shebang `#!/bin/sh`) đã thực sự được exec. Vấn đề là: không có một dòng `echo` nào trong script của mình xuất hiện trên console cả, dù nó chắc chắn đã chạy (rồi tới `exec /bin/sh` và panic vì PID 1 không được phép thoát).
+
+### Đi tìm lý do: printk hoạt động, nhưng userspace write() thì không
+Để debug mà không phụ thuộc vào đường I/O đang nghi ngờ, mình cho `/init` ghi log qua `/dev/kmsg` (đường này đi thẳng vào `printk`, một đường ghi console hoàn toàn khác, đã biết chắc là hoạt động) thay vì `echo` thường. Kết quả: script chạy đúng như mong đợi, in ra đầy đủ. Vậy vấn đề nằm ở chính con đường ghi console "bình thường" (`write()` vào `/dev/console`).
+
+Vấn đề là `printk` của kernel dùng một đường ghi console riêng, gọi trực tiếp `outb` và poll `LSR` (đúng như code `handle_io` cũ ở trên đã emulate) - không cần ngắt. Nhưng `write()` từ một process bình thường lại đi qua tty layer chuẩn của driver 8250, driver này chỉ ghi một đợt (burst) đầu tiên rồi **chờ ngắt THRE** (Transmitter Holding Register Empty) để biết là được ghi tiếp - và VMM của mình chưa bao giờ raise bất kỳ ngắt nào cho COM1 cả, nên nó treo ở đó vĩnh viễn.
+
+Mình thêm ngắt bằng ioctl `KVM_IRQ_LINE` (raise rồi lower ngay, giả lập một edge - như thiết bị ISA thật), gọi ngay sau khi in ký tự ra ở `COM1_DATA`:
+{% highlight rust %}
+fn pulse_irq(vm_fd: BorrowedFd, irq: u32) -> Result<()> {
+    let mut level = kvm_irq_level { irq, level: 1 };
+    unsafe { ioctl(vm_fd.as_raw_fd(), KVM_IRQ_LINE, &level) };
+    level.level = 0;
+    unsafe { ioctl(vm_fd.as_raw_fd(), KVM_IRQ_LINE, &level) };
+    Ok(())
+}
+{% endhighlight %}
+Chạy lại... vẫn im lặng y hệt. Ngắt được raise (không lỗi), nhưng chẳng có gì thay đổi.
+
+### `uart:unknown` - driver còn chưa nhận ra có UART
+Check tiếp bằng `/proc/interrupts` và `/proc/tty/driver/serial` (vẫn qua `/dev/kmsg`):
+{% highlight bash %}
+0: uart:unknown port:000003F8 irq:4
+           4:          0    XT-PIC      (không có dòng này!)
+{% endhighlight %}
+`uart:unknown` nghĩa là hàm `autoconfig()` của driver 8250 không nhận diện được chip UART, nên driver không bao giờ thực sự "mở" port này (không `request_irq`, dù số `irq:4` vẫn hiện ra từ static table). Việc ngắt mình vừa thêm vào chẳng có ai lắng nghe cả.
+
+Lục lại source `drivers/tty/serial/8250/8250_port.c` (bản 4.14) thì `autoconfig()` có 2 test tồn tại trước khi đi vào việc nhận diện chip, fail 1 trong 2 là auto bị coi là `PORT_UNKNOWN`:
+1. Ghi `0` rồi `0x0F` vào `IER`, đọc lại phải đúng y hệt - do code cũ của mình return cứng `0` cho mọi lần đọc IER (không lưu trạng thái gì cả) nên test này luôn fail.
+2. Bật loopback mode qua `MCR` (`LOOP | 0x0A`), đọc `MSR` phải ra đúng `0x90` (MCR's RTS/DTR/OUT1/OUT2 phải "loop" ngược lại thành CTS/DSR/RI/DCD trên MSR) - code cũ cũng return cứng `0` cho MSR nên fail luôn.
+
+Tức là 2 register `IER` và `MCR` cần phải là register "thật" (lưu và đọc lại đúng giá trị đã ghi), chứ không phải no-op như trước. Mình thêm 2 field `Cell<u8>` vào `VCpu` để lưu trạng thái này (chỉ có 2 lựa chọn: hoặc thêm field mới vào struct, hoặc track state ở đâu đó khác - thêm field coi như là "thêm mới", không sửa logic cũ):
+{% highlight rust %}
+(COM1_IER, true) => { self.com1_ier.set(unsafe { *data_ptr }); }
+(COM1_IER, false) => unsafe { *data_ptr = self.com1_ier.get(); },
+(COM1_MCR, true) => { self.com1_mcr.set(unsafe { *data_ptr }); }
+(COM1_MSR, false) => {
+    let mcr = self.com1_mcr.get();
+    let msr = if mcr & 0x10 != 0 {
+        ((mcr & 0x01) << 5)  // DTR -> DSR
+            | ((mcr & 0x02) << 3)  // RTS -> CTS
+            | ((mcr & 0x04) << 4)  // OUT1 -> RI
+            | ((mcr & 0x08) << 4)  // OUT2 -> DCD
+    } else { 0 };
+    unsafe { *data_ptr = msr; }
+}
+{% endhighlight %}
+
+### Lần chạy thứ hai: nhận đúng chip, nhưng driver lại kêu "too much work"
+Sau khi thêm 2 register trên, `/proc/tty/driver/serial` báo `uart:8250 irq:4`, và `/proc/interrupts` đã có dòng `4: ... ttyS0` tăng dần - ngắt đã có người lắng nghe! Nhưng dmesg lại xuất hiện:
+{% highlight bash %}
+[    0.942144] serial8250: too much work for irq4
+{% endhighlight %}
+lặp lại liên tục. Lý do: ISR của driver đọc `IIR` trong một vòng lặp, cứ thấy "còn ngắt đang chờ" (`bit 0 = 0`) là nó lại xử lý tiếp, tới khi chạm giới hạn an toàn (256 lần) mới chịu dừng và log cảnh báo này. Code cũ (và cả bản mình mới thêm interrupt) đều return cứng `0x02` (nghĩa là "luôn luôn đang chờ xử lý") cho mọi lần đọc `IIR` - nên vòng lặp không bao giờ tự thoát bằng cách tự nhiên.
+
+Trên phần cứng thật, đọc `IIR` trong lúc nguyên nhân là THRE chính là hành động "acknowledge" - nó phải tự động chuyển state về "không còn gì để xử lý" (`0x01`). Mình thêm một cờ `com1_thre_pending: Cell<bool>` để mô phỏng đúng hành vi đó, và chỉ raise ngắt khi driver thực sự đã bật `IER`'s THRI bit (tránh việc spam ngắt từ sớm trước khi driver kịp enable nó):
+{% highlight rust %}
+(COM1_DATA, true) => {
+    // ... in ký tự ra như cũ ...
+    if self.com1_ier.get() & 0x02 != 0 {
+        self.com1_thre_pending.set(true);
+        Self::pulse_irq(vm_fd, COM1_IRQ)?;
+    }
+}
+(COM1_IIR, false) => {
+    let iir = if self.com1_thre_pending.take() { 0x02 } else { 0x01 };
+    unsafe { *data_ptr = iir; }
+}
+{% endhighlight %}
+
+### Kết quả
+{% highlight bash %}
+=== rust-kvm-tool: busybox initramfs loaded ===
+Linux (none) 4.14.174 #2 SMP Wed Jul 14 11:47:24 UTC 2021 x86_64 GNU/Linux
+Dropping to a busybox shell (exec /bin/sh).
+
+/bin/sh: can't access tty; job control turned off
+~ #
+{% endhighlight %}
+Lần đầu tiên thấy một cái prompt shell thật sự (`~ #`) xuất hiện trên console, không còn panic nữa. Chưa gõ được gì vào đó (chưa emulate keyboard/RX cho serial - `/bin/sh` giờ chỉ block ở `read()` chờ input không bao giờ tới, thay vì bị kill PID 1 ngay lập tức như trước), nhưng đó là một câu chuyện khác cho lần sau.
+
+Điều thú vị nhất rút ra được ở phần này: bug này không nằm ở chỗ thiếu tính năng (thiếu ngắt) mà mình tưởng ban đầu, mà là ở việc driver có hẳn một bước "kiểm tra tồn tại" trước khi tin rằng có phần cứng thật ở đó - một VMM tối giản như thế này rất dễ bỏ sót những bước "vô hình" kiểu vậy, vì mọi thứ vẫn *trông* như chạy được (kernel vẫn boot, vẫn in log bình thường) cho tới khi động vào đúng con đường phụ thuộc vào nó.
 
 # References
 - [KVM API Documentation](https://www.kernel.org/doc/html/latest/virt/kvm/api.html)
